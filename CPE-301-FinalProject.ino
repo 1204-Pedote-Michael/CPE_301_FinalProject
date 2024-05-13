@@ -14,10 +14,6 @@ volatile unsigned char* port_c = (unsigned char*) 0x28;
 volatile unsigned char* ddr_c  = (unsigned char*) 0x27;  
 volatile unsigned char* pin_c  = (unsigned char*) 0x26;
 
-volatile unsigned char* port_e = (unsigned char*) 0x2E; 
-volatile unsigned char* ddr_e  = (unsigned char*) 0x2D;  
-volatile unsigned char* pin_e  = (unsigned char*) 0x2C;
-
 volatile unsigned char *myUCSR0A = (unsigned char *)0x00C0;
 volatile unsigned char *myUCSR0B = (unsigned char *)0x00C1;
 volatile unsigned char *myUCSR0C = (unsigned char *)0x00C2;
@@ -40,14 +36,13 @@ volatile unsigned char *myTIFR1 =  (unsigned char *) 0x36;
 #define GREEN_ON *port_c |= 0b00000001
 #define BLUE_OFF *port_c &= 0b11111101
 #define BLUE_ON *port_c |= 0b00000010
-#define RED_OFF *port_c &= 0b11111110
+#define RED_OFF *port_c &= 0b11111011
 #define RED_ON *port_c |= 0b00000100
 #define YELLOW_OFF *port_c &= 0b11110111
 #define YELLOW_ON *port_c |= 0b00001000
+#define ALL_OFF *port_c &= 0b11110000
 #define FAN_OFF *port_c &= 0b11101111
 #define FAN_ON *port_c |= 0b00010000
-#define WATER_SENSOR_OFF *port_e &= 0b10111111
-#define WATER_SENSOR_ON *port_e |= 0b01000000
 
 #define RDA 0x80
 #define TBE 0x20 
@@ -65,12 +60,12 @@ const int stepsPerRevolution = 2038;
 
 Stepper myStepper = Stepper(stepsPerRevolution, 7, 9, 8, 10);
 
+enum State {DISABLED, IDLE, ERROR, RUNNING};
+
 RTC_DS1307 rtc;
-bool prevPower;
-bool power;
-bool on; 
+
 void setup() {
-  // put your setup code here, to run once:
+
   U0init(9600);
   lcd.begin(16,2);
   adc_init();
@@ -79,48 +74,104 @@ void setup() {
 
   rtc.adjust(DateTime(2024,5,11,19,0,0));
 
-  *ddr_k &= 0xFB;
-  *ddr_c |= 0x5F;
-  *ddr_e |= 0x01;
+  attachInterrupt(digitalPinToInterrupt(18),onOffButton,FALLING);
+  attachInterrupt(digitalPinToInterrupt(19),resetButton,FALLING);
 
-  *port_k |= 0x04;
+  *ddr_k &= 0xEF;
+  *ddr_c |= 0x1F;
 
-  power = 0;
-  prevPower = 0;
-  on = 0;
+  *port_k |= 0x10;
 }
 
-
+enum State curState = DISABLED, prevState = DISABLED;
 
 
 void loop() {
-  
-  bool tooLow = 0;
-  String message;
-  char messageArr[25];
-  int waterLevel = adc_read(0);
 
-  power = (bool) *pin_k & 0x04;
-  if(power == 1 && prevPower == 0){
-    on ^= 1;
-    U0putchar('y');
+  potentiometer();
+  
+  switch(curState){
+    case IDLE:
+      ALL_OFF;
+      GREEN_ON;
+      FAN_OFF;
+      
+      if(checkTemp()){
+        curState = RUNNING;
+      }
+      if(!checkWater()){
+        curState = ERROR;
+      }
+      break;
+    case ERROR:
+      ALL_OFF;
+      FAN_OFF;
+      RED_ON;
+      
+      lcd.setCursor(0,0);
+      lcd.println("ERROR Water Low  ");
+
+      break;
+    case RUNNING:
+      ALL_OFF;
+      FAN_ON;
+      BLUE_ON;
+      if(!checkWater()){
+        curState = ERROR;
+      }
+      if(!checkTemp()){
+        curState = IDLE;
+      }
+      break;
+    case DISABLED:
+      ALL_OFF;
+      YELLOW_ON;
+      FAN_OFF;
+      break;
   }
-  if(on){
-    if(waterLevel < 100){
-      message = "Water level low\n";
-      message.toCharArray(messageArr, 25);
-      printArr(messageArr, 16);
-      tooLow = 1;
+  if(prevState != curState){
+    switch(curState){
+      case IDLE:
+      printString("IDLE ");
+      break;
+    case ERROR:
+      lcd.clear();
+      printString("ERROR ");
+      break;
+    case RUNNING:
+      printString("RUNNING ");
+      break;
+    case DISABLED:
+      printString("DISABLED ");
+      break; 
     }
+    printTime();
+
+  }
+  prevState = curState;
+}
+
+void potentiometer(){
+  int pot = adc_read(10);
+  if(pot > 200){
+    myStepper.setSpeed(5);
+    myStepper.step(100);
+
+  }else if(pot < 50){
+    myStepper.setSpeed(5);
+    myStepper.step(-100);
+
+  }else{
+    myStepper.step(0);
+  }
+}
+
+bool checkTemp(){
     int temperature = 0;
     int humidity = 0;
 
-    // Attempt to read the temperature and humidity values from the DHT11 sensor.
     int result = dht11.readTemperatureHumidity(temperature, humidity);
 
-    // Check the results of the readings.
-    // If the reading is successful, print the temperature and humidity values.
-    // If there are errors, print the appropriate error messages.
     if (result == 0) {
       lcd.setCursor(0,0);
       lcd.print("Temperature: ");
@@ -131,18 +182,33 @@ void loop() {
       lcd.print(humidity);
       lcd.println("%   ");
     } else {
-        // Print error message based on the error code.
       lcd.println(DHT11::getErrorString(result));
     }
-    if(temperature > 26){
-      FAN_ON;
-    }else if(temperature < 22){
-      FAN_OFF;
+    if(temperature >= 20){
+      return 1;
+    }else{
+      return 0;
     }
+    my_delay(1000);
+}
 
+void onOffButton(){
+  if(curState != DISABLED){
+    curState = DISABLED;
+  }else{
+    curState = RUNNING;
   }
-  
-	prevPower = power;
+}
+
+void resetButton(){
+  if(checkWater() && curState == ERROR){
+    curState = IDLE;
+  }
+}
+
+bool checkWater(){
+  int waterLevel = adc_read(0);
+  return waterLevel > 100;
 }
 
 void printTime(){
@@ -183,23 +249,15 @@ void printTwo(char* arr, bool gt){
     U0putchar(arr[0]);    
   }
 }
-void printArr(char* arr, int size){
-  for(int i = 0; i < size; i++){
+void printString(String str){
+  char arr[str.length()];
+  str.toCharArray(arr,str.length());
+  for(int i = 0; i < str.length(); i++){
     U0putchar(arr[i]);
   }
 }
-void yeet(){
-  myStepper.setSpeed(5);
-	myStepper.step(stepsPerRevolution);
-	delay(1000);
-	
-	// Rotate CCW quickly at 10 RPM
-	myStepper.setSpeed(10);
-	myStepper.step(-stepsPerRevolution);
-	delay(1000);
 
-  
-}
+
 
 void adc_init()
 {
